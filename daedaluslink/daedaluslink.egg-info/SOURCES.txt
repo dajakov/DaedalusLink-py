@@ -1,0 +1,9 @@
+LICENSE
+README.md
+pyproject.toml
+setup.cfg
+daedaluslink/daedaluslink.egg-info/PKG-INFO
+daedaluslink/daedaluslink.egg-info/SOURCES.txt
+daedaluslink/daedaluslink.egg-info/dependency_links.txt
+daedaluslink/daedaluslink.egg-info/requires.txt
+daedaluslink/daedaluslink.egg-info/top_level.txt
