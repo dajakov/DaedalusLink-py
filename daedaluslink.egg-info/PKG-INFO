@@ -1,12 +1,21 @@
 Metadata-Version: 2.4
 Name: daedaluslink
 Version: 0.1.1
-Summary: A lightweight WebSocket link interface for robots
-Home-page: https://github.com/dajakov/DaedalusLink
-Author: David Jakovlev
-Author-email: Your Name <you@example.com>
-License: MIT
-Requires-Python: >=3.8
+Summary: An application that connects to a robot for advanced controls and visualization of data.
+Author-email: David Jakovlev <contact@dajakov.com>
+License-Expression: GPL-3.0-or-later
+Project-URL: Homepage, https://github.com/dajakov/DaedalusLink
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Education
+Classifier: Intended Audience :: Science/Research
+Classifier: Topic :: Software Development :: Libraries
+Classifier: Topic :: System :: Hardware
+Classifier: Topic :: Scientific/Engineering :: Human Machine Interfaces
+Classifier: Topic :: Utilities
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Requires-Python: >=3.7
 Description-Content-Type: text/markdown
 License-File: LICENSE
 Requires-Dist: websocket-server>=0.6.4

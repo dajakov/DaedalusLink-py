@@ -1,3 +1,33 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "daedaluslink"
+version = "0.1.1"
+description = "An application that connects to a robot for advanced controls and visualization of data."
+readme = "README.md"
+requires-python = ">=3.7"
+license = "GPL-3.0-or-later"
+authors = [
+    { name = "David Jakovlev", email = "contact@dajakov.com" }
+]
+urls = { "Homepage" = "https://github.com/dajakov/DaedalusLink" }
+dependencies = ["websocket-server>=0.6.4"]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Hardware",
+    "Topic :: Scientific/Engineering :: Human Machine Interfaces",
+    "Topic :: Utilities",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["daedaluslink*"]
