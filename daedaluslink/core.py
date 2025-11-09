@@ -1,5 +1,8 @@
 import json
 import time
+import threading
+import asyncio
+import socket
 from websocket_server import WebsocketServer
 
 
@@ -12,6 +15,9 @@ class DaedalusLink:
         self.callbacks = {}
         self.clients = []
         self.client_last_seen = {}
+        self.broadcast_config = None
+        self.broadcast_thread = None
+        self._broadcast_stop_event = threading.Event()
 
     # --- GUI Elements ---
     def add_button(self, label, command=None, position=[0, 0], size=[2, 1]):
@@ -159,12 +165,85 @@ class DaedalusLink:
             }
             self.server.send_message(client, json.dumps(error_msg))
 
-    # --- Run Server ---
+    def enable_discovery_broadcast(
+        self,
+        udp_port: int = 7777,
+        interval: float = 1.0,
+    ):
+        """Configure UDP discovery broadcast (starts automatically on run())."""
+        self.broadcast_config = {
+            "robotId": self.link_id,
+            "name": self.name,
+            "wsPort": 8081,
+            "udpPort": udp_port,
+            "interval": interval,
+        }
+
+    def disable_discovery_broadcast(self):
+        """Stop discovery broadcasting."""
+        if self.broadcast_thread and self.broadcast_thread.is_alive():
+            print("[DaedalusLink] Stopping discovery broadcast...")
+            self._broadcast_stop_event.set()
+            self.broadcast_thread.join(timeout=2)
+        self.broadcast_config = None
+        self.broadcast_thread = None
+        self._broadcast_stop_event.clear()
+        print("[DaedalusLink] Discovery broadcast disabled.")
+
+    async def _broadcast_loop(self):
+        """Internal async loop for broadcasting."""
+        cfg = self.broadcast_config
+        if not cfg:
+            return
+
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        udp_socket.setblocking(False)
+
+        msg = json.dumps({
+            "robotId": cfg["robotId"],
+            "name": cfg["name"],
+            "wsPort": cfg["wsPort"],
+        }).encode("utf-8")
+
+        while not self._broadcast_stop_event.is_set():
+            try:
+                udp_socket.sendto(msg, ("255.255.255.255", cfg["udpPort"]))
+            except Exception as e:
+                print(f"[DaedalusLink] UDP broadcast error: {e}")
+            await asyncio.sleep(cfg["interval"])
+
+        udp_socket.close()
+
+    def _start_broadcast_thread(self):
+        """Start background thread for broadcasting (only if configured)."""
+        if not self.broadcast_config:
+            return
+        if self.broadcast_thread and self.broadcast_thread.is_alive():
+            return
+
+        self._broadcast_stop_event.clear()
+        self.broadcast_thread = threading.Thread(
+            target=lambda: asyncio.run(self._broadcast_loop()),
+            daemon=True
+        )
+        self.broadcast_thread.start()
+        print("[DaedalusLink] Discovery broadcast started.")
+
     def run(self, port=8081, debug=True):
         self.server = WebsocketServer(host="0.0.0.0", port=port)
         self.server.set_fn_new_client(self._on_new_client)
         self.server.set_fn_message_received(self._on_message)
         self.server.set_fn_client_left(self._on_client_left)
 
-        print(f"RobotGUI running at ws://0.0.0.0:{port}")
-        self.server.run_forever()
+        print(f"[DaedalusLink] WebSocket running at ws://0.0.0.0:{port}")
+
+        if self.broadcast_config:
+            self._start_broadcast_thread()
+
+        try:
+            self.server.run_forever()
+        except KeyboardInterrupt:
+            print("\n[DaedalusLink] Stopping server...")
+        finally:
+            self.disable_discovery_broadcast()

@@ -37,6 +37,11 @@ gui.add_joystick("move", axes=["X", "Y"], command="move", position=[2, 7], size=
 gui.add_slider("Joint 1", command="j1", position=[0, 3], size=[1, 9])
 gui.add_slider("Joint 2", command="j2", position=[1, 3], size=[1, 9])
 
+gui.enable_discovery_broadcast(
+    udp_port=7777,
+    interval=1.0
+)
+
 @gui.on("MOVE_FORWARD")
 def forward(pressed: bool):
     if pressed:
