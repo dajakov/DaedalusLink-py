@@ -1,12 +1,17 @@
 from daedaluslink import DaedalusLink
 
-gui = DaedalusLink(name="R2D2", link_id=1)
+gui = DaedalusLink(name="R2D2", link_id=12345)
 
 gui.add_button("forward", command="MOVE_FORWARD", position=[0, 2], size=[4, 1])
 gui.add_button("backward", command="MOVE_BACKWARD", position=[4, 2], size=[4, 1])
 gui.add_joystick("move", axes=["X", "Y"], command="move", position=[2, 7], size=[6, 6])
 gui.add_slider("Joint 1", command="j1", position=[0, 3], size=[1, 9])
 gui.add_slider("Joint 2", command="j2", position=[1, 3], size=[1, 9])
+
+gui.enable_discovery_broadcast(
+    udp_port=7777,
+    interval=1.0
+)
 
 @gui.on("MOVE_FORWARD")
 def forward(pressed: bool):
