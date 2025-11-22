@@ -2,6 +2,11 @@ from daedaluslink import DaedalusLink
 
 gui = DaedalusLink(name="R2D2", link_id=12345)
 
+gui.enable_authentication()
+gui.add_user("pilot", "password123", role="user")
+gui.add_user("maint", "myadminpwd", role="admin")
+gui.add_user("dev", "supersecretdev", role="developer")
+
 gui.add_button("forward", command="MOVE_FORWARD", position=[0, 2], size=[4, 1])
 gui.add_button("backward", command="MOVE_BACKWARD", position=[4, 2], size=[4, 1])
 gui.add_joystick("move", axes=["X", "Y"], command="move", position=[2, 7], size=[6, 6])

@@ -1,3 +1,8 @@
+import os
+import hmac
+import hashlib
+import random
+import string
 import json
 import time
 import threading
@@ -18,8 +23,20 @@ class DaedalusLink:
         self.broadcast_config = None
         self.broadcast_thread = None
         self._broadcast_stop_event = threading.Event()
+        self.auth_enabled = False
+        self.users = {}
+        self.pending_challenges = {}
+        self.authenticated = {}
 
-    # --- GUI Elements ---
+    def enable_authentication(self):
+        self.auth_enabled = True
+
+    def add_user(self, username, password, role="user"):
+        self.users[username] = {
+            "password": password,
+            "role": role
+        }
+
     def add_button(self, label, command=None, position=[0, 0], size=[2, 1]):
         self.interface_data.append({
             "type": "button",
@@ -48,14 +65,12 @@ class DaedalusLink:
             "command": command
         })
 
-    # --- Event Handling ---
     def on(self, command):
         def decorator(fn):
             self.callbacks[command] = fn
             return fn
         return decorator
 
-    # --- Server Handling ---
     def _send_config(self, client):
         config = {
             "type": "config",
@@ -71,9 +86,23 @@ class DaedalusLink:
         self.server.send_message(client, json.dumps(config))
 
     def _on_new_client(self, client, server):
-        self.clients.append(client)
-        print(f"New client connected: {client['id']}")
+        cid = client["id"]
+        print(f"New client connected: {cid}")
+
+        if self.auth_enabled:
+            challenge = ''.join(random.choices(string.ascii_letters + string.digits, k=32))
+            self.pending_challenges[cid] = challenge
+
+            auth_msg = {
+                "type": "auth_required",
+                "challenge": challenge,
+                "roles": ["user", "admin", "developer"]
+            }
+            self.server.send_message(client, json.dumps(auth_msg))
+            return
+
         self._send_config(client)
+ 
 
     def _on_client_left(self, client, server):
         print(f"Client {client['id']} disconnected")
@@ -97,6 +126,61 @@ class DaedalusLink:
 
         cmd = msg.get("command") or msg.get("type") or msg.get("payload")
         if not cmd:
+            return
+
+        if cmd == "auth":
+            cid = client["id"]
+            username = msg.get("username")
+            response = msg.get("response")
+            challenge = self.pending_challenges.get(cid)
+
+            if not username or not response or not challenge:
+                self.server.send_message(client, json.dumps({
+                    "type": "auth_error",
+                    "message": "Invalid auth request"
+                }))
+                return
+
+            user = self.users.get(username)
+            if not user:
+                self.server.send_message(client, json.dumps({
+                    "type": "auth_error",
+                    "message": "User not found"
+                }))
+                return
+
+            expected = hmac.new(
+                user["password"].encode(),
+                challenge.encode(),
+                hashlib.sha256
+            ).hexdigest()
+
+            if hmac.compare_digest(response, expected):
+                print(f"Client {cid} authenticated as {username} ({user['role']})")
+                self.authenticated[cid] = user["role"]
+
+                # Send config now!
+                self._send_config(client)
+
+                self.server.send_message(client, json.dumps({
+                    "type": "auth_success",
+                    "role": user["role"]
+                }))
+
+            else:
+                self.server.send_message(client, json.dumps({
+                    "type": "auth_error",
+                    "message": "Invalid signature"
+                }))
+            return
+
+        # refuse cmds when not authenticated
+        cid = client["id"]
+        if self.auth_enabled and cid not in self.authenticated:
+            self.server.send_message(client, json.dumps({
+                "type": "error",
+                "message": "Not authenticated"
+            }))
             return
 
         # client heartbeat
