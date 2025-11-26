@@ -1,3 +1,4 @@
+# daedaluslink_v2.py
 import os
 import hmac
 import hashlib
@@ -12,30 +13,84 @@ from websocket_server import WebsocketServer
 
 
 class DaedalusLink:
+    """
+    DaedalusLink v2
+    - Protocol "checking in on ya" (proto_major/proto_minor) sent on connect
+    - Optional challenge-response HMAC auth
+    - Per-connection metadata (authenticated, username, role, device_id)
+    - Role-based command enforcement
+    - Discovery broadcast (UDP)
+    """
+
     def __init__(self, name, link_id):
+        # identity
         self.name = name
         self.link_id = link_id
+
+        # websocket server
         self.server = None
+
+        # GUI description
         self.interface_data = []
         self.callbacks = {}
+        self.command_roles = {}  # command -> list of allowed roles (None = any)
+
+        # connection bookkeeping
         self.clients = []
+        self.client_meta = {}  # client_id -> dict with metadata
         self.client_last_seen = {}
+
+        # discovery broadcast
         self.broadcast_config = None
         self.broadcast_thread = None
         self._broadcast_stop_event = threading.Event()
+
+        # authentication
         self.auth_enabled = False
+        # users: username -> {"password": "plain_or_hash", "role": "..."}
+        # NOTE: for production consider storing hashed passwords and verifying with bcrypt.
         self.users = {}
+        # pending challenges: client_id -> challenge
         self.pending_challenges = {}
-        self.authenticated = {}
+        # authenticated mapping: client_id -> username/role stored in client_meta
+        # (we keep client_meta for all per-client state)
+
+        # protocol version
+        self.proto_major = 1
+        self.proto_minor = 0
+
+    # -------------------------
+    # Public APIs
+    # -------------------------
+    def set_protocol_version(self, major: int, minor: int):
+        """Set server protocol version sent to clients on connect."""
+        self.proto_major = int(major)
+        self.proto_minor = int(minor)
 
     def enable_authentication(self):
+        """Require challenge-response HMAC auth before sending config/accepting commands."""
         self.auth_enabled = True
 
-    def add_user(self, username, password, role="user"):
-        self.users[username] = {
-            "password": password,
-            "role": role
-        }
+    def disable_authentication(self):
+        self.auth_enabled = False
+
+    def add_user(self, username: str, password: str, role: str = "user"):
+        """
+        Add a user. For MCU-style deployments you may keep plaintext; in normal servers
+        you should store salted hashes and verify accordingly.
+        """
+        self.users[str(username)] = {"password": str(password), "role": str(role)}
+
+    def remove_user(self, username: str):
+        if username in self.users:
+            del self.users[username]
+
+    def set_command_roles(self, command: str, roles: list):
+        """
+        Restrict a command to certain roles, e.g. ["admin", "developer"].
+        Pass roles=None to allow all authenticated users.
+        """
+        self.command_roles[command] = None if roles is None else list(roles)
 
     def add_button(self, label, command=None, position=[0, 0], size=[2, 1]):
         self.interface_data.append({
@@ -71,7 +126,37 @@ class DaedalusLink:
             return fn
         return decorator
 
+    # -------------------------
+    # Internal helpers
+    # -------------------------
+    def _send_hello(self, client):
+        """Send initial hello message including protocol version and whether auth is required."""
+        checking_in_on_ya = {
+            "type": "checking_in_on_ya",
+            "proto_major": self.proto_major,
+            "proto_minor": self.proto_minor,
+            "auth_required": bool(self.auth_enabled),
+            "linkId": self.link_id,
+            "name": self.name,
+        }
+        self.server.send_message(client, json.dumps(checking_in_on_ya))
+
     def _send_config(self, client):
+        """Send GUI config payload (only after auth if enabled)."""
+        # Optionally tailor config by role
+        cid = client["id"]
+        meta = self.client_meta.get(cid, {})
+        role = meta.get("role", "user") if meta.get("authenticated") else "guest"
+
+        interface = list(self.interface_data)
+        # Example: append debug control for developers/admins
+        if role in ("developer", "admin"):
+            interface.append({
+                "type": "text",
+                "label": "debug",
+                "content": "developer controls enabled"
+            })
+
         config = {
             "type": "config",
             "payload": {
@@ -80,56 +165,145 @@ class DaedalusLink:
                 "commandUpdateFrequency": 500,
                 "sensorUpdateFrequency": 1000,
                 "debugLogUpdateFrequency": 2000,
-                "interfaceData": self.interface_data
+                "interfaceData": interface,
+                "role": role,
+                "proto_major": self.proto_major,
+                "proto_minor": self.proto_minor
             }
         }
         self.server.send_message(client, json.dumps(config))
 
-    def _on_new_client(self, client, server):
+    def _generate_challenge(self, length=32):
+        return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+
+    def _cleanup_client(self, client):
         cid = client["id"]
-        print(f"New client connected: {cid}")
-
-        if self.auth_enabled:
-            challenge = ''.join(random.choices(string.ascii_letters + string.digits, k=32))
-            self.pending_challenges[cid] = challenge
-
-            auth_msg = {
-                "type": "auth_required",
-                "challenge": challenge,
-                "roles": ["user", "admin", "developer"]
-            }
-            self.server.send_message(client, json.dumps(auth_msg))
-            return
-
-        self._send_config(client)
- 
-
-    def _on_client_left(self, client, server):
-        print(f"Client {client['id']} disconnected")
-
-        cid = client["id"]
+        # remove challenge if any
+        if cid in self.pending_challenges:
+            del self.pending_challenges[cid]
+        if cid in self.client_meta:
+            del self.client_meta[cid]
         if cid in self.client_last_seen:
             del self.client_last_seen[cid]
+        # remove from clients list if present
+        try:
+            if client in self.clients:
+                self.clients.remove(client)
+        except Exception:
+            # sometimes client equality is not direct; remove by id
+            self.clients = [c for c in self.clients if c.get("id") != cid]
 
-        if client in self.clients:
-            self.clients.remove(client)
+    def _is_command_allowed_for_client(self, client, command):
+        """Role-based command enforcement. Returns (allowed: bool, reason:str)."""
+        cid = client["id"]
+        meta = self.client_meta.get(cid, {})
+        if self.auth_enabled and not meta.get("authenticated"):
+            return False, "Not authenticated"
+
+        required_roles = self.command_roles.get(command, None)
+        if required_roles is None:
+            # no role restriction
+            return True, ""
+        role = meta.get("role")
+        if role in required_roles:
+            return True, ""
+        return False, f"forbidden: role '{role}' not allowed"
+
+    # -------------------------
+    # Websocket event handlers
+    # -------------------------
+    def _on_new_client(self, client, server):
+        cid = client["id"]
+        print(f"[DaedalusLink] New client connected: {cid}")
+
+        # store client in list and init meta
+        self.clients.append(client)
+        self.client_meta[cid] = {
+            "authenticated": False,
+            "username": None,
+            "role": None,
+            "connected_at": int(time.time()),
+            "device_id": None
+        }
+
+        # Always send hello first so clients can version-negotiate or react to auth_required
+        self._send_hello(client)
+
+        # If auth disabled: send config immediately
+        if not self.auth_enabled:
+            self._send_config(client)
+            return
+
+        # If auth enabled: generate challenge and send explicit auth_required (client may already expect it)
+        challenge = self._generate_challenge()
+        self.pending_challenges[cid] = challenge
+
+        auth_msg = {
+            "type": "auth_required",
+            "challenge": challenge,
+            "roles": ["user", "developer", "admin"]
+        }
+        self.server.send_message(client, json.dumps(auth_msg))
+
+    def _on_client_left(self, client, server):
+        print(f"[DaedalusLink] Client {client['id']} disconnected")
+        # cleanup state
+        self._cleanup_client(client)
 
     def _on_message(self, client, server, message):
+        cid = client["id"]
+        # try parse JSON first
         try:
             msg = json.loads(message)
         except json.JSONDecodeError:
-            # Handle raw text: e.g. "move 108,-75" or "slider 42"
+            # Backwards-compatible: raw text handling as before
             parts = message.split(" ", 1)
             cmd = parts[0]
             payload = parts[1] if len(parts) > 1 else None
             msg = {"command": cmd, "data": payload}
 
+        # Determine command/type field
         cmd = msg.get("command") or msg.get("type") or msg.get("payload")
         if not cmd:
             return
 
+        # Handle checking in protocol from client (optional): client may send its own proto info
+        if cmd == "checking_in_on_ya":
+            client_proto_maj = int(msg.get("proto_major", 0))
+            client_proto_min = int(msg.get("proto_minor", 0))
+            device_id = msg.get("device_id")
+            # store device_id if provided
+            if device_id:
+                self.client_meta[cid]["device_id"] = device_id
+
+            # Basic compatibility check: server rejects if client major != server major
+            if client_proto_maj != self.proto_major:
+                # send incompatible notice and close
+                incompat = {
+                    "type": "incompatible",
+                    "message": "protocol_major_mismatch",
+                    "server_proto_major": self.proto_major,
+                    "server_proto_minor": self.proto_minor,
+                    "client_proto_major": client_proto_maj,
+                    "client_proto_minor": client_proto_min
+                }
+                self.server.send_message(client, json.dumps(incompat))
+                try:
+                    server.close_client(client)
+                except Exception:
+                    pass
+                return
+            # otherwise accept and keep going (client will still need to auth if required)
+            # ack hello
+            self.server.send_message(client, json.dumps({
+                "type": "checking_in_on_ya_ack",
+                "proto_major": self.proto_major,
+                "proto_minor": self.proto_minor
+            }))
+            return
+
+        # Authentication flow
         if cmd == "auth":
-            cid = client["id"]
             username = msg.get("username")
             response = msg.get("response")
             challenge = self.pending_challenges.get(cid)
@@ -149,6 +323,7 @@ class DaedalusLink:
                 }))
                 return
 
+            # compute expected HMAC: HMAC_SHA256(key=password, message=challenge)
             expected = hmac.new(
                 user["password"].encode(),
                 challenge.encode(),
@@ -156,39 +331,38 @@ class DaedalusLink:
             ).hexdigest()
 
             if hmac.compare_digest(response, expected):
-                print(f"Client {cid} authenticated as {username} ({user['role']})")
-                self.authenticated[cid] = user["role"]
+                # authenticated
+                self.client_meta[cid].update({
+                    "authenticated": True,
+                    "username": username,
+                    "role": user.get("role", "user"),
+                    "auth_time": int(time.time())
+                })
+                # clear pending challenge
+                if cid in self.pending_challenges:
+                    del self.pending_challenges[cid]
 
-                # Send config now!
-                self._send_config(client)
+                print(f"[DaedalusLink] Client {cid} authenticated as {username} ({user.get('role')})")
 
+                # send success + role info
                 self.server.send_message(client, json.dumps({
                     "type": "auth_success",
-                    "role": user["role"]
+                    "role": user.get("role", "user")
                 }))
 
+                # send config now that client is authenticated
+                self._send_config(client)
             else:
+                # invalid signature
                 self.server.send_message(client, json.dumps({
                     "type": "auth_error",
                     "message": "Invalid signature"
                 }))
             return
 
-        # refuse cmds when not authenticated
-        cid = client["id"]
-        if self.auth_enabled and cid not in self.authenticated:
-            self.server.send_message(client, json.dumps({
-                "type": "error",
-                "message": "Not authenticated"
-            }))
-            return
-
-        # client heartbeat
+        # heartbeat / ack handling
         if cmd == "ack":
-            client_id = client["id"]
-            self.client_last_seen[client_id] = time.time()
-
-            # Echo back heartbeat ack
+            self.client_last_seen[cid] = time.time()
             hb_ack = {
                 "type": "ack",
                 "command": "heartbeat",
@@ -197,41 +371,67 @@ class DaedalusLink:
             self.server.send_message(client, json.dumps(hb_ack))
             return
 
-        # Handle button press/release
+        # If auth is enabled and client not authenticated, refuse any non-auth commands
+        if self.auth_enabled and not self.client_meta.get(cid, {}).get("authenticated", False):
+            self.server.send_message(client, json.dumps({
+                "type": "error",
+                "message": "Not authenticated"
+            }))
+            return
+
+        # From this point, the client is allowed to issue commands (or auth disabled)
+        # Figure out pressed state (legacy behavior) and data payload
         pressed = True
         if isinstance(cmd, str) and cmd.startswith("!"):
             cmd = cmd[1:]
             pressed = False
 
-        args = []
         data = msg.get("data")
 
+        # enforce role restrictions if configured
+        allowed, reason = self._is_command_allowed_for_client(client, cmd)
+        if not allowed:
+            self.server.send_message(client, json.dumps({
+                "type": "error",
+                "message": reason
+            }))
+            return
+
+        # dispatch to callback if present
         if cmd in self.callbacks:
             fn = self.callbacks[cmd]
-
-            # Parse payload into args
-            if data is None:
-                args = [pressed]
-                fn(*args)
-            elif isinstance(data, str):
-                if "," in data:
-                    args = [arg.strip() for arg in data.split(",")]
-                    args = [int(a) if a.lstrip("-").isdigit() else a for a in args]
+            args = []
+            try:
+                if data is None:
+                    # no explicit data → use pressed boolean (legacy)
+                    args = [pressed]
                     fn(*args)
-                elif data.lstrip("-").isdigit():
-                    args = [int(data)]
-                    fn(*args)
+                elif isinstance(data, str):
+                    # string may be comma-separated or single int or text
+                    if "," in data:
+                        parts = [p.strip() for p in data.split(",")]
+                        # convert numeric parts to int when possible
+                        parsed = [int(p) if p.lstrip("-").isdigit() else p for p in parts]
+                        fn(*parsed)
+                    elif data.lstrip("-").isdigit():
+                        fn(int(data))
+                    else:
+                        fn(data)
+                elif isinstance(data, list):
+                    # pass list elements as positional args
+                    fn(*data)
                 else:
-                    args = [data]
-                    fn(*args)
-            elif isinstance(data, list):
-                args = data
-                fn(*args)
-            else:
-                args = [data]
-                fn(*args)
+                    # other types passed as single argument
+                    fn(data)
+            except Exception as e:
+                # notify client about handler error but do not crash
+                self.server.send_message(client, json.dumps({
+                    "type": "error",
+                    "message": f"handler error: {e}"
+                }))
+                return
 
-            # Send structured command ack
+            # ack the command
             ack = {
                 "type": "ack",
                 "command": cmd,
@@ -239,21 +439,18 @@ class DaedalusLink:
                 "timestamp": int(time.time())
             }
             self.server.send_message(client, json.dumps(ack))
-
         else:
-            # Unknown command → send error
-            error_msg = {
+            # unknown command
+            self.server.send_message(client, json.dumps({
                 "type": "error",
                 "error": f"Unknown command: {cmd}",
                 "timestamp": int(time.time())
-            }
-            self.server.send_message(client, json.dumps(error_msg))
+            }))
 
-    def enable_discovery_broadcast(
-        self,
-        udp_port: int = 7777,
-        interval: float = 1.0,
-    ):
+    # -------------------------
+    # Discovery broadcast
+    # -------------------------
+    def enable_discovery_broadcast(self, udp_port: int = 7777, interval: float = 1.0):
         """Configure UDP discovery broadcast (starts automatically on run())."""
         self.broadcast_config = {
             "robotId": self.link_id,
@@ -288,6 +485,9 @@ class DaedalusLink:
             "robotId": cfg["robotId"],
             "name": cfg["name"],
             "wsPort": cfg["wsPort"],
+            "proto_major": self.proto_major,
+            "proto_minor": self.proto_minor,
+            "auth_required": bool(self.auth_enabled)
         }).encode("utf-8")
 
         while not self._broadcast_stop_event.is_set():
@@ -314,13 +514,16 @@ class DaedalusLink:
         self.broadcast_thread.start()
         print("[DaedalusLink] Discovery broadcast started.")
 
+    # -------------------------
+    # Run server
+    # -------------------------
     def run(self, port=8081, debug=True):
         self.server = WebsocketServer(host="0.0.0.0", port=port)
         self.server.set_fn_new_client(self._on_new_client)
         self.server.set_fn_message_received(self._on_message)
         self.server.set_fn_client_left(self._on_client_left)
 
-        print(f"[DaedalusLink] WebSocket running at ws://0.0.0.0:{port}")
+        print(f"[DaedalusLink] WebSocket running at ws://0.0.0.0:{port} (proto {self.proto_major}.{self.proto_minor})")
 
         if self.broadcast_config:
             self._start_broadcast_thread()
