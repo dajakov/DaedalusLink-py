@@ -2,7 +2,7 @@ from daedaluslink import DaedalusLink
 
 gui = DaedalusLink(name="R2D2", link_id=12345)
 
-gui.enable_authentication()
+#gui.enable_authentication()
 gui.add_user("pilot", "password123", role="user")
 gui.add_user("maint", "myadminpwd", role="admin")
 gui.add_user("dev", "supersecretdev", role="developer")

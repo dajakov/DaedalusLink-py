@@ -146,16 +146,9 @@ class DaedalusLink:
         # Optionally tailor config by role
         cid = client["id"]
         meta = self.client_meta.get(cid, {})
-        role = meta.get("role", "user") if meta.get("authenticated") else "guest"
 
         interface = list(self.interface_data)
         # Example: append debug control for developers/admins
-        if role in ("developer", "admin"):
-            interface.append({
-                "type": "text",
-                "label": "debug",
-                "content": "developer controls enabled"
-            })
 
         config = {
             "type": "config",
@@ -166,9 +159,6 @@ class DaedalusLink:
                 "sensorUpdateFrequency": 1000,
                 "debugLogUpdateFrequency": 2000,
                 "interfaceData": interface,
-                "role": role,
-                "proto_major": self.proto_major,
-                "proto_minor": self.proto_minor
             }
         }
         self.server.send_message(client, json.dumps(config))
@@ -192,6 +182,66 @@ class DaedalusLink:
         except Exception:
             # sometimes client equality is not direct; remove by id
             self.clients = [c for c in self.clients if c.get("id") != cid]
+
+    def _verify_signed_packet(self, cid, msg):
+        """
+        Verify the HMAC signature, timestamp and nonce for replay protection.
+        Requires client to be authenticated.
+        """
+
+        meta = self.client_meta.get(cid)
+        if not meta or not meta.get("authenticated"):
+            return False, "not authenticated"
+
+        username = meta["username"]
+        user = self.users.get(username)
+        if not user:
+            return False, "unknown user"
+
+        password = user["password"]              # (plaintext or hash-for-MCU)
+
+        ts = msg.get("ts")
+        nonce = msg.get("nonce")
+        signature = msg.get("signature")
+
+        if ts is None or nonce is None or signature is None:
+            return False, "missing ts/nonce/signature"
+
+        # 1) timestamp freshness (±10 seconds)
+        now = int(time.time())
+        if abs(now - int(ts)) > 10:
+            return False, "timestamp expired"
+
+        # 2) nonce uniqueness
+        nonce_map = self.used_nonces.setdefault(cid, {})
+        if nonce in nonce_map:
+            return False, "nonce replay detected"
+        # store nonce with timestamp
+        nonce_map[nonce] = now
+
+        # cleanup old nonces (>10s)
+        for n, t in list(nonce_map.items()):
+            if now - t > 10:
+                del nonce_map[n]
+
+        # 3) verify HMAC signature
+        content = json.dumps({
+            "ts": ts,
+            "nonce": nonce,
+            "command": msg.get("command"),
+            "data": msg.get("data")
+        }, separators=(",", ":"), sort_keys=True)
+
+        expected = hmac.new(
+            password.encode(),
+            content.encode(),
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(expected, signature):
+            return False, "invalid signature"
+
+        return True, ""
 
     def _is_command_allowed_for_client(self, client, command):
         """Role-based command enforcement. Returns (allowed: bool, reason:str)."""
@@ -378,6 +428,16 @@ class DaedalusLink:
                 "message": "Not authenticated"
             }))
             return
+
+        # If auth enabled, all commands must be signed (except 'auth' itself)
+        if self.auth_enabled:
+            ok, reason = self._verify_signed_packet(cid, msg)
+            if not ok:
+                self.server.send_message(client, json.dumps({
+                    "type": "error",
+                    "message": f"security: {reason}"
+                }))
+                return
 
         # From this point, the client is allowed to issue commands (or auth disabled)
         # Figure out pressed state (legacy behavior) and data payload
