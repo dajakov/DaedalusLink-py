@@ -19,6 +19,13 @@ class DaedalusLink:
         self.broadcast_thread = None
         self._broadcast_stop_event = threading.Event()
 
+        self.proto_major = 1
+        self.proto_minor = 0
+
+    def set_protocol_version(self, major: int, minor: int):
+        self.proto_major = int(major)
+        self.proto_minor = int(minor)
+
     # --- GUI Elements ---
     def add_button(self, label, command=None, position=[0, 0], size=[2, 1]):
         self.interface_data.append({
@@ -55,6 +62,14 @@ class DaedalusLink:
             return fn
         return decorator
 
+    def _send_hello(self, client):
+        checking_in_on_ya = {
+            "type": "checking_in_on_ya",
+            "proto_major": self.proto_major,
+            "proto_minor": self.proto_minor,
+        }
+        self.server.send_message(client, json.dumps(checking_in_on_ya))
+
     # --- Server Handling ---
     def _send_config(self, client):
         config = {
@@ -73,6 +88,8 @@ class DaedalusLink:
     def _on_new_client(self, client, server):
         self.clients.append(client)
         print(f"New client connected: {client['id']}")
+        self._send_hello(client)
+        time.sleep(1)
         self._send_config(client)
 
     def _on_client_left(self, client, server):
